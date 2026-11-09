@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops
 # ============================================================
 W, H, FPS = 1080, 1920, 30
 VOICE = "hi-IN-MadhurNeural"      # male Hindi. For female use "hi-IN-SwaraNeural"
-RATE = "+20%"                     # voice speed. Higher = shorter video
+RATE = "+30%"                     # voice speed. Higher = shorter video
 TAIL = 0.30                       # pause (seconds) after each line
 MUSIC_VOLUME = 0.10               # only used if music.mp3 exists
 
