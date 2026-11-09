@@ -1,0 +1,544 @@
+"""
+LocalBoost - 3D-style explainer Reel generator (1080x1920, Hindi voiceover)
+
+Run:   python make_video.py
+Needs: logo.png or logo.webp (your brand logo) in the same folder
+Optional: music.mp3 (background music, mixed in quietly)
+Output: reel.mp4
+"""
+import os
+import math
+import asyncio
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops
+
+# ============================================================
+#  1. SETTINGS  (edit these)
+# ============================================================
+W, H, FPS = 1080, 1920, 30
+VOICE = "hi-IN-MadhurNeural"      # male Hindi. For female use "hi-IN-SwaraNeural"
+RATE = "+20%"                     # voice speed. Higher = shorter video
+TAIL = 0.30                       # pause (seconds) after each line
+MUSIC_VOLUME = 0.10               # only used if music.mp3 exists
+
+# Brand colours (taken from the LocalBoost logo)
+NAVY = (11, 61, 145)
+BLUE = (0, 102, 178)
+ORANGE = (240, 110, 30)
+GREEN = (92, 184, 46)
+RED = (227, 38, 46)
+YELLOW = (245, 184, 32)
+GREY = (90, 100, 120)
+ACCENTS = [BLUE, ORANGE, GREEN, RED, NAVY]
+
+# ============================================================
+#  2. SCRIPT  (voice = what is spoken, on-screen text is English)
+# ============================================================
+INTRO_VOICE = ("आपके Competitors ये दस tools रोज़ इस्तेमाल करते हैं, "
+               "और आपने अभी तक खोले भी नहीं! और सब बिल्कुल फ्री हैं!")
+
+OUTRO_VOICE = ("इस video को अभी Save कीजिए, दोस्त को Share कीजिए, "
+               "और ऐसे ही Business Secrets के लिए LocalBoost को Follow कीजिए!")
+
+TOOLS = [
+    dict(n="Meta Ad Library", cat="AD SPY",
+         sub="See every ad your competitor runs",
+         voice="एक, Meta Ad Library। Competitor के सारे Ads देखिए।"),
+    dict(n="Google Ads Transparency Center", cat="AD SPY",
+         sub="Spot their Google ads instantly",
+         voice="दो, Google Ads Transparency Center। Google पर चल रहे Ads देखिए।"),
+    dict(n="Wayback Machine", cat="SPY",
+         sub="View their old websites",
+         voice="तीन, Wayback Machine। Competitor की पुरानी website देखिए।"),
+    dict(n="Trustpilot", cat="RESEARCH",
+         sub="Read real customer reviews",
+         voice="चार, Trustpilot। असली Customer Reviews पढ़िए।"),
+    dict(n="Google Trends", cat="RESEARCH",
+         sub="See what is trending right now",
+         voice="पाँच, Google Trends। अभी क्या चल रहा है, पता चलेगा।"),
+    dict(n="Google Keyword Planner", cat="RESEARCH",
+         sub="Find what people search for",
+         voice="छह, Google Keyword Planner। लोग क्या search करते हैं, जानिए।"),
+    dict(n="Google Search Console", cat="SEO",
+         sub="Know where you rank on Google",
+         voice="सात, Google Search Console। आप Google में कहाँ हैं, पता कीजिए।"),
+    dict(n="Microsoft Clarity", cat="ANALYTICS",
+         sub="Watch where visitors click",
+         voice="आठ, Microsoft Clarity। लोग आपकी website पर कहाँ click करते हैं, देखिए।"),
+    dict(n="PageSpeed Insights", cat="SPEED",
+         sub="Check how fast your website is",
+         voice="नौ, PageSpeed Insights। आपकी website कितनी fast है, जाँचिए।"),
+    dict(n="Google Business Profile", cat="LOCAL",
+         sub="Get free local customers",
+         voice="और दस, Google Business Profile। फ्री में नए Customers पाइए।"),
+]
+
+# ============================================================
+#  3. SMALL HELPERS
+# ============================================================
+BOLD_PATHS = [
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
+REG_PATHS = [
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+]
+_FONTS = {}
+
+
+def font(size, bold=True):
+    key = (size, bold)
+    if key not in _FONTS:
+        f = None
+        for p in (BOLD_PATHS if bold else REG_PATHS):
+            if os.path.exists(p):
+                f = ImageFont.truetype(p, size)
+                break
+        _FONTS[key] = f or ImageFont.load_default()
+    return _FONTS[key]
+
+
+def clamp(x, a=0.0, b=1.0):
+    return max(a, min(b, x))
+
+
+def ease_out_cubic(x):
+    return 1 - (1 - clamp(x)) ** 3
+
+
+def ease_in_cubic(x):
+    return clamp(x) ** 3
+
+
+def ease_out_back(x):
+    x = clamp(x)
+    c1 = 1.70158
+    c3 = c1 + 1
+    return 1 + c3 * (x - 1) ** 3 + c1 * (x - 1) ** 2
+
+
+def wrap(draw, text, f, maxw):
+    lines, cur = [], ""
+    for word in text.split():
+        t = (cur + " " + word).strip()
+        if draw.textlength(t, font=f) <= maxw:
+            cur = t
+        else:
+            if cur:
+                lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def text_block(draw, cx, y, text, f, fill, maxw, gap=1.18, shadow=None):
+    """Draw centred, wrapped text. Returns the y below the block."""
+    for line in wrap(draw, text, f, maxw):
+        w = draw.textlength(line, font=f)
+        if shadow:
+            draw.text((cx - w / 2 + 4, y + 5), line, font=f, fill=shadow)
+        draw.text((cx - w / 2, y), line, font=f, fill=fill)
+        y += f.size * gap
+    return y
+
+
+def with_alpha(img, a):
+    if a >= 0.999:
+        return img
+    r, g, b, al = img.split()
+    al = al.point(lambda p: int(p * a))
+    return Image.merge("RGBA", (r, g, b, al))
+
+
+# ============================================================
+#  4. 3D-LOOK BUILDING BLOCKS
+# ============================================================
+def sphere(d, color):
+    """Shaded 3D sphere sprite (RGBA)."""
+    ss = 2
+    n = d * ss
+    y, x = np.mgrid[0:n, 0:n].astype(np.float32)
+    c = (n - 1) / 2
+    nx, ny = (x - c) / (n / 2), (y - c) / (n / 2)
+    rr = nx ** 2 + ny ** 2
+    nz = np.sqrt(np.clip(1 - rr, 0, 1))
+    L = np.array([-0.5, -0.6, 0.62], np.float32)
+    L /= np.linalg.norm(L)
+    diff = np.clip(nx * L[0] + ny * L[1] + nz * L[2], 0, 1)
+    spec = diff ** 40 * 0.9
+    base = np.array(color, np.float32)
+    rgb = base[None, None, :] * (0.40 + 0.75 * diff[..., None]) + 255 * spec[..., None]
+    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    a = np.where(rr <= 1, 255, 0).astype(np.uint8)
+    img = Image.fromarray(np.dstack([rgb, a]), "RGBA")
+    return img.resize((d, d), Image.LANCZOS)
+
+
+def soft_shadow(w, h, alpha=70):
+    pad = 40
+    im = Image.new("RGBA", (w + pad * 2, h + pad * 2), (10, 30, 90, 0))
+    ImageDraw.Draw(im).ellipse((pad, pad, pad + w, pad + h), fill=(10, 30, 90, alpha))
+    return im.filter(ImageFilter.GaussianBlur(18))
+
+
+def make_card(w, h, accent, depth=22, radius=60, face=(255, 255, 255),
+              border=14, pad=70):
+    """Thick rounded 'slab' with extrusion + soft shadow. Returns (sprite, (face_x, face_y))."""
+    ss = 2
+    cw, ch = w + 2 * pad, h + 2 * pad + depth
+    layer = Image.new("RGBA", (cw * ss, ch * ss), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    dark = tuple(int(c * 0.55) for c in accent)
+
+    def rr(x0, y0, x1, y1, fill):
+        d.rounded_rectangle([x0 * ss, y0 * ss, x1 * ss, y1 * ss], radius * ss, fill=fill)
+
+    for i in range(depth, 0, -1):          # extrusion (gives the 3D thickness)
+        rr(pad, pad + i, pad + w, pad + h + i, dark)
+    if border:
+        rr(pad, pad, pad + w, pad + h, accent)
+        rr(pad, pad + border, pad + w, pad + h, face)
+    else:
+        rr(pad, pad, pad + w, pad + h, face)
+    layer = layer.resize((cw, ch), Image.LANCZOS)
+
+    sh = Image.new("RGBA", (cw, ch), (10, 30, 90, 0))
+    ImageDraw.Draw(sh).rounded_rectangle(
+        [pad + 8, pad + depth + 26, pad + w - 8, pad + h + depth + 26],
+        radius, fill=(10, 30, 90, 120))
+    sh = sh.filter(ImageFilter.GaussianBlur(24))
+    return Image.alpha_composite(sh, layer), (pad, pad)
+
+
+def _coeffs(dst, src):
+    A, B = [], []
+    for (x, y), (X, Y) in zip(dst, src):
+        A.append([x, y, 1, 0, 0, 0, -X * x, -X * y])
+        A.append([0, 0, 0, x, y, 1, -Y * x, -Y * y])
+        B += [X, Y]
+    return np.linalg.solve(np.array(A, float), np.array(B, float))
+
+
+def tilt(img, ang, dist=2400):
+    """Rotate a sprite around its vertical axis with perspective (fake 3D)."""
+    if abs(ang) < 0.2:
+        return img
+    w, h = img.size
+    th = math.radians(ang)
+    src = [(0, 0), (w, 0), (w, h), (0, h)]
+    dst = []
+    for x, y in src:
+        X, Y = x - w / 2, y - h / 2
+        s = dist / (dist + X * math.sin(th))
+        dst.append((w / 2 + X * math.cos(th) * s, h / 2 + Y * s))
+    return img.transform((w, h), Image.PERSPECTIVE, _coeffs(dst, src), Image.BICUBIC)
+
+
+# ---------- logo ----------
+def load_logo():
+    for p in ("logo.png", "logo.webp", "logo.jpg", "logo.jpeg"):
+        if os.path.exists(p):
+            im = Image.open(p).convert("RGB")
+            diff = ImageChops.difference(im, Image.new("RGB", im.size, (255, 255, 255)))
+            bbox = diff.convert("L").point(lambda v: 255 if v > 12 else 0).getbbox()
+            if bbox:
+                im = im.crop(bbox)
+            return im.convert("RGBA")
+    print("!! logo not found (logo.png / logo.webp) - using text instead")
+    im = Image.new("RGBA", (700, 200), (255, 255, 255, 255))
+    d = ImageDraw.Draw(im)
+    d.text((350, 100), "LocalBoost", font=font(120), fill=NAVY, anchor="mm")
+    return im
+
+
+LOGO = None
+
+
+def logo_fit(maxw, maxh):
+    global LOGO
+    if LOGO is None:
+        LOGO = load_logo()
+    s = min(maxw / LOGO.width, maxh / LOGO.height)
+    return LOGO.resize((int(LOGO.width * s), int(LOGO.height * s)), Image.LANCZOS)
+
+
+def logo_card(w, h, logo_w, logo_h, depth=24, radius=64, border=16):
+    card, (ox, oy) = make_card(w, h, BLUE, depth=depth, radius=radius, border=border)
+    lg = logo_fit(logo_w, logo_h)
+    card.paste(lg, (ox + (w - lg.width) // 2, oy + border // 2 + (h - lg.height) // 2), lg)
+    return card
+
+
+# ---------- chips / pills ----------
+def pill(text, color, w, h, size, depth=12):
+    card, (ox, oy) = make_card(w, h, color, depth=depth, radius=h // 2,
+                               face=color, border=0, pad=40)
+    d = ImageDraw.Draw(card)
+    d.text((ox + w / 2, oy + h / 2 - 2), text, font=font(size), fill=(255, 255, 255), anchor="mm")
+    return card
+
+
+# ============================================================
+#  5. BACKGROUND (gradient + floating 3D spheres)
+# ============================================================
+def make_base():
+    y = np.linspace(0, 1, H, dtype=np.float32)[:, None, None]
+    top = np.array((250, 252, 255), np.float32)
+    bot = np.array((222, 236, 252), np.float32)
+    arr = (top * (1 - y) + bot * y) * np.ones((1, W, 1), np.float32)
+    img = Image.fromarray(arr.astype(np.uint8), "RGB")
+    blobs = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(blobs)
+    d.ellipse((W - 380, -260, W + 260, 380), fill=ORANGE + (70,))
+    d.ellipse((-300, H - 520, 340, H + 120), fill=BLUE + (60,))
+    d.ellipse((W - 300, H - 760, W + 200, H - 260), fill=GREEN + (45,))
+    blobs = blobs.filter(ImageFilter.GaussianBlur(90))
+    img.paste(blobs, (0, 0), blobs)
+    return img
+
+
+BASE = None
+FLOATERS = None
+
+
+def init_background():
+    global BASE, FLOATERS
+    BASE = make_base()
+    spec = [  # diameter, colour, x, y, amp_x, amp_y, speed, phase
+        (150, ORANGE, 90, 470, 30, 40, 0.9, 0.0),
+        (110, GREEN, 975, 640, 25, 35, 1.1, 1.3),
+        (190, BLUE, 985, 1420, 35, 45, 0.7, 2.1),
+        (90, RED, 60, 1230, 20, 30, 1.2, 0.7),
+        (70, YELLOW, 930, 300, 15, 20, 1.4, 2.8),
+        (130, GREEN, 60, 1720, 30, 30, 0.8, 4.0),
+        (100, ORANGE, 950, 1800, 25, 30, 1.0, 5.1),
+    ]
+    FLOATERS = []
+    for d, col, x, y, ax, ay, sp, ph in spec:
+        FLOATERS.append((sphere(d, col), soft_shadow(int(d * 0.9), int(d * 0.22)),
+                         d, x, y, ax, ay, sp, ph))
+
+
+def base_frame(tg):
+    f = BASE.copy()
+    for spr, shd, d, x, y, ax, ay, sp, ph in FLOATERS:
+        cx = x + ax * math.sin(tg * sp + ph)
+        cy = y + ay * math.cos(tg * sp * 0.8 + ph)
+        f.paste(shd, (int(cx - shd.width / 2), int(cy + d * 0.55 - shd.height / 2 + 30)), shd)
+        f.paste(spr, (int(cx - d / 2), int(cy - d / 2)), spr)
+    return f
+
+
+# ============================================================
+#  6. ANIMATION HELPERS
+# ============================================================
+def draw_card(frame, spr, cx, cy, t, amp=8, xoff=0, delay=0.0):
+    """Pop-in with spin, then gentle 3D sway + float. Returns current angle."""
+    tt = t - delay
+    if tt <= 0:
+        return -50
+    e = ease_out_cubic(tt / 0.6)
+    s = ease_out_back(tt / 0.6)
+    ang = -50 * (1 - e) + amp * math.sin(1.6 * tt) * e
+    if s < 0.03:
+        return ang
+    im = tilt(spr, ang)
+    if abs(s - 1) > 0.005:
+        im = im.resize((max(2, int(im.width * s)), max(2, int(im.height * s))), Image.BILINEAR)
+    cy2 = cy + 14 * math.sin(tt * 2.1)
+    frame.paste(im, (int(cx + xoff - im.width / 2), int(cy2 - im.height / 2)), im)
+    return ang
+
+
+def draw_pop(frame, spr, cx, cy, t, delay=0.0, bob=0.0, speed=2.4, xoff=0):
+    tt = t - delay
+    if tt <= 0:
+        return
+    s = ease_out_back(tt / 0.5)
+    if s < 0.03:
+        return
+    im = spr
+    if abs(s - 1) > 0.005:
+        im = spr.resize((max(2, int(spr.width * s)), max(2, int(spr.height * s))), Image.BILINEAR)
+    y = cy + bob * math.sin(tt * speed + delay * 3)
+    frame.paste(im, (int(cx + xoff - im.width / 2), int(y - im.height / 2)), im)
+
+
+def draw_fade_slide(frame, spr, cx, cy, t, delay=0.0, rise=60):
+    tt = t - delay
+    if tt <= 0:
+        return
+    e = ease_out_cubic(tt / 0.5)
+    im = with_alpha(spr, e)
+    frame.paste(im, (int(cx - im.width / 2), int(cy + rise * (1 - e) - im.height / 2)), im)
+
+
+def draw_progress(frame, frac, label):
+    d = ImageDraw.Draw(frame)
+    x0, x1, y = 140, 940, 1600
+    d.rounded_rectangle((x0, y, x1, y + 26), 13, fill=(214, 225, 242))
+    fw = int((x1 - x0) * frac)
+    if fw > 26:
+        d.rounded_rectangle((x0, y, x0 + fw, y + 26), 13, fill=ORANGE)
+    d.text((W // 2, y + 72), label, font=font(40), fill=NAVY, anchor="mm")
+
+
+# ============================================================
+#  7. SCENES
+# ============================================================
+def make_top_ui():
+    """Logo plate + headline shown on every tool scene."""
+    plate, (ox, oy) = make_card(330, 240, BLUE, depth=14, radius=40, border=0, pad=50)
+    lg = logo_fit(280, 190)
+    plate.paste(lg, (ox + (330 - lg.width) // 2, oy + (240 - lg.height) // 2), lg)
+    head = Image.new("RGBA", (W, 190), (255, 255, 255, 0))
+    d = ImageDraw.Draw(head)
+    d.text((W / 2, 55), "10 FREE TOOLS", font=font(86), fill=NAVY, anchor="mm")
+    d.text((W / 2, 140), "your competitors use every day", font=font(42, False),
+           fill=GREY, anchor="mm")
+    return plate, head
+
+
+def intro_scene(dur, t0):
+    card = logo_card(880, 720, 760, 600)
+    title = Image.new("RGBA", (1000, 520), (255, 255, 255, 0))
+    d = ImageDraw.Draw(title)
+    d.text((500, 70), "10 FREE TOOLS", font=font(104), fill=NAVY, anchor="mm")
+    d.text((500, 190), "YOUR COMPETITORS USE", font=font(56), fill=ORANGE, anchor="mm")
+    d.text((500, 270), "EVERY SINGLE DAY", font=font(56), fill=ORANGE, anchor="mm")
+    d.text((500, 380), "and you have not opened them yet!", font=font(46, False),
+           fill=GREY, anchor="mm")
+    free = pill("100% FREE", GREEN, 400, 96, 52)
+
+    def mf(t):
+        f = base_frame(t0 + t)
+        ex = clamp((t - (dur - 0.35)) / 0.35)
+        xoff = -ease_in_cubic(ex) * (W + 400)
+        draw_card(f, card, W / 2, 700, t, amp=6, xoff=xoff)
+        if xoff == 0:
+            draw_fade_slide(f, title, W / 2, 1390, t, delay=0.55)
+            draw_pop(f, free, W / 2, 1690, t, delay=1.0, bob=8)
+        return np.array(f)
+    return mf
+
+
+def tool_scene(idx, tool, dur, t0, top_ui):
+    plate, head = top_ui
+    acc = ACCENTS[(idx - 1) % len(ACCENTS)]
+    w, h = 900, 640
+    card, (ox, oy) = make_card(w, h, acc)
+    d = ImageDraw.Draw(card)
+    cx = ox + w // 2
+
+    # measure content so it sits in the vertical centre of the card
+    size = 100
+    while True:
+        nf = font(size)
+        name_lines = wrap(d, tool["n"], nf, 780)
+        if len(name_lines) <= 2 or size <= 72:
+            break
+        size -= 8
+    sf = font(42, False)
+    sub_lines = wrap(d, tool["sub"], sf, 760)
+    chip_f = font(36)
+    chip_w = int(d.textlength(tool["cat"], font=chip_f)) + 80
+    total = 64 + 40 + len(name_lines) * size * 1.18 + 28 + len(sub_lines) * 42 * 1.3
+    y = oy + border_off(h, total)
+
+    d.rounded_rectangle((cx - chip_w // 2, y, cx + chip_w // 2, y + 64), 32, fill=acc)
+    d.text((cx, y + 32), tool["cat"], font=chip_f, fill=(255, 255, 255), anchor="mm")
+    y += 64 + 40
+    y = text_block(d, cx, y, tool["n"], nf, NAVY, 780, gap=1.18)
+    y += 28
+    text_block(d, cx, y, tool["sub"], sf, GREY, 760, gap=1.3)
+
+    bd = sphere(230, acc)
+    bdraw = ImageDraw.Draw(bd, "RGBA")
+    bdraw.text((117, 119), str(idx), font=font(130), fill=(0, 0, 0, 80), anchor="mm")
+    bdraw.text((115, 115), str(idx), font=font(130), fill=(255, 255, 255, 255), anchor="mm")
+    free = pill("100% FREE", GREEN, 380, 88, 48)
+    cy = 1090
+
+    def mf(t):
+        f = base_frame(t0 + t)
+        f.paste(plate, (int(W / 2 - plate.width / 2), int(215 - plate.height / 2)), plate)
+        f.paste(head, (0, 330), head)
+        ex = clamp((t - (dur - 0.35)) / 0.35)
+        xoff = -ease_in_cubic(ex) * (W + 400)
+        ang = draw_card(f, card, W / 2, cy, t, xoff=xoff)
+        draw_pop(f, bd, 150 - ang * 2.0, cy - 345, t, delay=0.25, bob=10, xoff=xoff)
+        draw_pop(f, free, W / 2, 1500, t, delay=0.5, bob=6, xoff=xoff)
+        frac = ((idx - 1) + ease_out_cubic(t / 0.6)) / len(TOOLS)
+        draw_progress(f, frac, f"{idx} / {len(TOOLS)}")
+        return np.array(f)
+    return mf
+
+
+def border_off(h, total):
+    return max(40, (h - total) / 2 + 8)
+
+
+def outro_scene(dur, t0):
+    card = logo_card(880, 720, 760, 600)
+    chips = [pill("SAVE", ORANGE, 280, 96, 48), pill("SHARE", BLUE, 280, 96, 48),
+             pill("FOLLOW", GREEN, 280, 96, 48)]
+    msg = Image.new("RGBA", (1000, 180), (255, 255, 255, 0))
+    d = ImageDraw.Draw(msg)
+    d.text((500, 50), "Follow for more", font=font(64), fill=NAVY, anchor="mm")
+    d.text((500, 130), "free business tools", font=font(64), fill=ORANGE, anchor="mm")
+
+    def mf(t):
+        f = base_frame(t0 + t)
+        draw_card(f, card, W / 2, 700, t, amp=6)
+        for i, c in enumerate(chips):
+            draw_pop(f, c, W / 2 + (i - 1) * 300, 1300, t, delay=0.6 + 0.3 * i, bob=8)
+        draw_fade_slide(f, msg, W / 2, 1550, t, delay=1.5)
+        return np.array(f)
+    return mf
+
+
+# ============================================================
+#  8. VOICEOVER (text to speech, free)
+# ============================================================
+async def _edge(text, path):
+    import edge_tts
+    await edge_tts.Communicate(text, VOICE, rate=RATE).save(path)
+
+
+def tts(text, path):
+    for attempt in range(3):
+        try:
+            asyncio.run(_edge(text, path))
+            if os.path.getsize(path) > 1000:
+                return
+        except Exception as e:
+            print(f"edge-tts attempt {attempt + 1} failed: {e}")
+    print("Falling back to gTTS (Google voice)")
+    from gtts import gTTS
+    gTTS(text=text, lang="hi").save(path)
+
+
+# ============================================================
+#  9. MAIN
+# ============================================================
+def main():
+    from moviepy.editor import (VideoClip, AudioFileClip, concatenate_videoclips,
+                                CompositeAudioClip)
+    from moviepy.audio.fx.all import audio_loop
+
+    init_background()
+    top_ui = make_top_ui()
+    os.makedirs("audio", exist_ok=True)
+
+    scenes = [("intro", None, INTRO_VOICE)]
+    scenes += [("tool", t, t["voice"]) for t in TOOLS]
+    scenes += [("outro", None, OUTRO_VOICE)]
+
+    paths, durs = [], []
+    for i, (_, _, text) in enumerate(scenes):
+        p = f"audio/s{i:02d}.mp3"
+        print(f"Voice {i + 1}/{len(
